@@ -1,234 +1,295 @@
-# test_cli.ps1  (Windows PowerShell 5.1 compatible, ASCII only)
-# - Descriptions printed before each test
-# - Retries failed tests up to 3 times
-# - Logs each attempt to .\logs\<timestamp>\NN_<name>_attemptX.log
-# - Per-test duration + overall summary runtime
-# - Compares first 100 IDs: --count=100 --json  vs  --count=150 --json (first 100)
-# - Final test: node index.js --count=100 verbose
+# test_cli.ps1
+# Runs the CLI test suite in a loop until Ctrl+X is pressed.
+# Creates logs in .\logs\<timestamp>\ per test (one file per test).
+# Compatible with Windows PowerShell 5.1+ (no null-coalescing, etc.)
 
-$ErrorActionPreference = "Continue"
+$ErrorActionPreference = 'Stop'
 
-# -------- Globals --------
-$script:PassCount = 0
-$script:FailCount = 0
-$script:CaseSeq   = 0
-$script:RunStart  = Get-Date
-$PauseBetweenMs   = 500
-
-# Logs root
-$stamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
-$logDir = Join-Path "." ("logs\" + $stamp)
-New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-
-function New-LogPath([string]$Name, [int]$Attempt = 1) {
-    $script:CaseSeq++
-    $safe = ($Name -replace '[^\w\-]+','_')
-    $file = "{0:D2}_{1}_attempt{2}.log" -f $script:CaseSeq, $safe, $Attempt
-    return (Join-Path $logDir $file)
+# ---------- Logging helpers ----------
+function New-RunLogDir {
+    $root = Join-Path $PSScriptRoot 'logs'
+    if (-not (Test-Path $root)) { New-Item -ItemType Directory -Path $root | Out-Null }
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $dir = Join-Path $root $stamp
+    New-Item -ItemType Directory -Path $dir | Out-Null
+    return $dir
 }
 
-function Parse-Counts([string[]]$Lines) {
-    # Prefer JSON output; fallback to human summary line
-    $text = $Lines -join "`n"
+function Sanitize-FileName {
+    param([string]$Name)
+    $invalid = [IO.Path]::GetInvalidFileNameChars()
+    $safe = $Name
+    foreach ($ch in $invalid) { $safe = $safe -replace ([Regex]::Escape($ch)), '_' }
+    $safe = $safe -replace '\s+', '_'  # collapse spaces
+    return $safe
+}
 
-    # Try JSON
+function Write-LogBlock {
+    param(
+        [string]$Path,
+        [string]$Header,
+        [string[]]$BodyLines
+    )
+    $divider = ('-' * 78)
+    $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $lines = @()
+    $lines += $divider
+    $lines += "$stamp  $Header"
+    $lines += $divider
+    $lines += $BodyLines
+    $lines += ""
+    $lines | Out-File -FilePath $Path -Encoding UTF8 -Append
+}
+
+# ---------- Result parsing ----------
+function Parse-Result {
+    param([string[]]$Lines)
+
+    $text = ($Lines -join "`n")
+
+    # Try JSON (when --json used)
     $json = $null
-    try { $json = $text | ConvertFrom-Json -ErrorAction Stop } catch { $json = $null }
-    if ($json -ne $null -and $json.summary -ne $null) {
-        $dups = 0
-        if ($json.summary.PSObject.Properties.Match('dupSkipped').Count -gt 0 -and $json.summary.dupSkipped -ne $null) {
-            $dups = [int]$json.summary.dupSkipped
+    try { $json = $text | ConvertFrom-Json -ErrorAction Stop } catch { }
+
+    if ($json -ne $null) {
+        $summary = $json.summary
+        $col = 0; $pages = 0; $dups = 0
+        if ($summary -ne $null) {
+            if ($summary.collected -ne $null) { $col = [int]$summary.collected }
+            if ($summary.pages -ne $null)     { $pages = [int]$summary.pages }
+            if ($summary.dupSkipped -ne $null){ $dups = [int]$summary.dupSkipped }
         }
-        return @{
-            Collected = [int]$json.summary.collected
-            Pages     = [int]$json.summary.pages
+        return [pscustomobject]@{
+            IsJson    = $true
+            Collected = $col
+            Pages     = $pages
             Dups      = $dups
+            Json      = $json
         }
     }
 
-    # Fallback: "Collected: N | Pages: M | Dups: K"
-    $m = [regex]::Match($text, 'Collected:\s*(\d+)\s*\|\s*Pages:\s*(\d+)\s*\|\s*Dups:\s*(\d+)', 'IgnoreCase')
-    if ($m.Success) {
-        return @{
-            Collected = [int]$m.Groups[1].Value
-            Pages     = [int]$m.Groups[2].Value
-            Dups      = [int]$m.Groups[3].Value
+    # Fallback: parse "Collected: X | Pages: Y | Dups: Z"
+    $col = 0; $pages = 0; $dups = 0
+    foreach ($line in $Lines) {
+        if ($line -match 'Collected:\s*(\d+)\s*\|\s*Pages:\s*(\d+)\s*\|\s*Dups:\s*(\d+)') {
+            $col   = [int]$matches[1]
+            $pages = [int]$matches[2]
+            $dups  = [int]$matches[3]
+            break
         }
     }
-
-    return $null
+    return [pscustomobject]@{
+        IsJson    = $false
+        Collected = $col
+        Pages     = $pages
+        Dups      = $dups
+        Json      = $null
+    }
 }
 
+# ---------- Test execution ----------
 function Invoke-TestCase {
-    <#
-.SYNOPSIS
-  Runs one test with retries and prints a short description.
-.PARAMETER Name
-  Short display name (used in logs).
-.PARAMETER Description
-  What is being validated.
-.PARAMETER ArgumentList
-  Arguments for: node index.js
-.PARAMETER MaxRetries
-  Number of attempts (default 3).
-#>
     param(
         [string]$Name,
         [string]$Description,
-        [string[]]$ArgumentList,
-        [int]$MaxRetries = 3
+        [string[]]$CaseArgs,
+        [string]$LogPath,
+        [int]$MaxRetries = 2  # total tries = 1 + MaxRetries
     )
 
-    Write-Host ("=== {0} ===" -f $Name) -ForegroundColor Cyan
-    Write-Host ("- {0}" -f $Description) -ForegroundColor DarkCyan
+    Write-Host "=== $Name ===" -ForegroundColor Cyan
+    if ($Description) { Write-Host "- $Description" -ForegroundColor DarkCyan }
 
     $attempt = 0
-    $passed  = $false
-    $finalCounts = $null
-    $finalExit   = $null
+    $resultObj = $null
 
-    $caseTimer = [System.Diagnostics.Stopwatch]::StartNew()
-
-    while (-not $passed -and ($attempt -lt $MaxRetries)) {
+    while ($true) {
         $attempt++
-        $logPath = New-LogPath -Name $Name -Attempt $attempt
-
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $output = & node index.js @ArgumentList 2>&1 | Tee-Object -FilePath $logPath
+        $output = & node .\index.js @CaseArgs 2>&1
         $exit   = $LASTEXITCODE
         $sw.Stop()
 
-        $counts = Parse-Counts $output
+        # Log this attempt
+        $hdr = ("{0} | args: {1} | attempt {2}" -f $Name, ($CaseArgs -join ' '), $attempt)
+        Write-LogBlock -Path $LogPath -Header $hdr -BodyLines $output
 
-        if ($exit -eq 0) { $passed = $true }
-        $finalExit   = $exit
-        $finalCounts = $counts
+        $parsed = Parse-Result -Lines $output
+        $dur = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+        $pass = ($exit -eq 0)
+        $status = if ($pass) { "PASS" } else { "FAIL" }
+        $color  = if ($pass) { "Green" } else { "Red" }
 
-        if ($passed) {
-            $col = if ($counts -ne $null -and $counts.ContainsKey('Collected')) { $counts.Collected } else { -1 }
-            $pag = if ($counts -ne $null -and $counts.ContainsKey('Pages'))     { $counts.Pages }     else { -1 }
-            $dup = if ($counts -ne $null -and $counts.ContainsKey('Dups'))      { $counts.Dups }      else { -1 }
-            Write-Host ("PASS (exit 0)  Duration: {0:N1}s  Collected:{1} Pages:{2} Dups:{3}" -f `
-                $sw.Elapsed.TotalSeconds, $col, $pag, $dup) -ForegroundColor Green
-            Write-Host ("Log: {0}" -f $logPath)
-        } else {
-            Write-Host ("Attempt {0}/{1} FAILED (exit {2}). Retrying..." -f $attempt, $MaxRetries, $exit) -ForegroundColor Yellow
-            Write-Host ("Log: {0}" -f $logPath)
-            Start-Sleep -Milliseconds 700
+        Write-Host ("{0} (exit {1})  Duration: {2}s  Collected:{3} Pages:{4} Dups:{5}" -f `
+            $status, $exit, $dur, $parsed.Collected, $parsed.Pages, $parsed.Dups) -ForegroundColor $color
+        Write-Host ("Log: {0}" -f $LogPath)
+
+        $resultObj = [pscustomobject]@{
+            Name      = $Name
+            Attempt   = $attempt
+            ExitCode  = $exit
+            DurationS = $dur
+            Collected = $parsed.Collected
+            Pages     = $parsed.Pages
+            Dups      = $parsed.Dups
+            Passed    = $pass
+            Output    = $output
+            Json      = $parsed.Json
+            Log       = $LogPath
         }
-    }
 
-    $caseTimer.Stop()
-    if ($passed) {
-        $script:PassCount++
-    } else {
-        $col = if ($finalCounts -ne $null -and $finalCounts.ContainsKey('Collected')) { $finalCounts.Collected } else { -1 }
-        $pag = if ($finalCounts -ne $null -and $finalCounts.ContainsKey('Pages'))     { $finalCounts.Pages }     else { -1 }
-        $dup = if ($finalCounts -ne $null -and $finalCounts.ContainsKey('Dups'))      { $finalCounts.Dups }      else { -1 }
-        Write-Host ("FAIL (exit {0})  Duration: {1:N1}s  Collected:{2} Pages:{3} Dups:{4}" -f `
-            $finalExit, $caseTimer.Elapsed.TotalSeconds, $col, $pag, $dup) -ForegroundColor Red
-        $script:FailCount++
+        if ($pass -or $attempt -gt $MaxRetries) { break }
+        Write-Host ("Retrying (attempt {0}/{1})..." -f ($attempt+1), (1+$MaxRetries)) -ForegroundColor Yellow
     }
 
     Write-Host ""
-    Start-Sleep -Milliseconds $PauseBetweenMs
+    return $resultObj
 }
 
-function Invoke-CompareFirst100 {
-    Write-Host "=== compare first 100: 100 vs 150 ===" -ForegroundColor Cyan
-    Write-Host "- Validates that the first 100 post IDs match between the 100-post run and the 150-post run." -ForegroundColor DarkCyan
+function Compare-FirstN {
+    param(
+        [int]$N = 100,
+        [string[]]$ArgsA = @("--count=100","--json"),
+        [string[]]$ArgsB = @("--count=150","--json"),
+        [string]$LogPath
+    )
 
-    $ok = $false
-    $attempt = 0
-    $max = 3
-    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $name = "compare_first_${N}_ids"
+    Write-Host "=== $name ===" -ForegroundColor Cyan
+    Write-Host "- Verifies first $N IDs are identical between 100 and 150 runs" -ForegroundColor DarkCyan
 
-    while (-not $ok -and ($attempt -lt $max)) {
-        $attempt++
-        $logA = New-LogPath "compare_A_100_json" $attempt
-        $logB = New-LogPath "compare_B_150_json" $attempt
+    $logHeader = "Comparison setup | A: {0} | B: {1}" -f ($ArgsA -join ' '), ($ArgsB -join ' ')
+    Write-LogBlock -Path $LogPath -Header $logHeader -BodyLines @()
 
-        $outA = & node index.js --count=100 --json 2>&1 | Tee-Object -FilePath $logA
-        $exitA = $LASTEXITCODE
-        $outB = & node index.js --count=150 --json 2>&1 | Tee-Object -FilePath $logB
-        $exitB = $LASTEXITCODE
+    $a = Invoke-TestCase -Name "json_100_A" -Description "JSON list for 100" -CaseArgs $ArgsA -LogPath $LogPath -MaxRetries 2
+    $b = Invoke-TestCase -Name "json_150_B" -Description "JSON list for 150" -CaseArgs $ArgsB -LogPath $LogPath -MaxRetries 2
 
-        try {
-            $jsonA = ($outA -join "`n") | ConvertFrom-Json
-            $jsonB = ($outB -join "`n") | ConvertFrom-Json
-
-            $idsA = @()
-            $idsB = @()
-            if ($jsonA -ne $null -and $jsonA.items -ne $null) {
-                $idsA = @($jsonA.items | Select-Object -First 100 | Select-Object -ExpandProperty id)
-            }
-            if ($jsonB -ne $null -and $jsonB.items -ne $null) {
-                $idsB = @($jsonB.items | Select-Object -First 100 | Select-Object -ExpandProperty id)
-            }
-
-            if ($exitA -eq 0 -and $exitB -eq 0 -and $idsA.Count -ge 100 -and $idsB.Count -ge 100) {
-                $mismatch = -1
-                for ($i=0; $i -lt 100; $i++) {
-                    if ($idsA[$i] -ne $idsB[$i]) { $mismatch = $i; break }
-                }
-                if ($mismatch -eq -1) {
-                    $ok = $true
-                    Write-Host ("PASS (first 100 IDs match). Attempt {0}/{1}" -f $attempt, $max) -ForegroundColor Green
-                    Write-Host ("Logs: {0} , {1}" -f $logA, $logB)
-                } else {
-                    Write-Host ("Mismatch at index {0}: A={1} vs B={2}" -f $mismatch, $idsA[$mismatch], $idsB[$mismatch]) -ForegroundColor Yellow
-                }
-            } else {
-                Write-Host ("One or both runs failed or returned too few items (A exit={0}, B exit={1})." -f $exitA, $exitB) -ForegroundColor Yellow
-            }
-        } catch {
-            Write-Host "JSON parse error while comparing. Will retry..." -ForegroundColor Yellow
-        }
-
-        if (-not $ok -and $attempt -lt $max) { Start-Sleep -Milliseconds 700 }
+    if (-not ($a.Passed -and $b.Passed)) {
+        $msg = "COMPARE: cannot compare because one or both runs failed."
+        Write-Host $msg -ForegroundColor Red
+        Write-LogBlock -Path $LogPath -Header "Comparison result" -BodyLines @($msg)
+        return [pscustomobject]@{ Name=$name; Passed=$false; DurationS=($a.DurationS + $b.DurationS); Log=$LogPath }
     }
 
-    $timer.Stop()
-    if ($ok) {
-        $script:PassCount++
-        Write-Host ("PASS  Duration: {0:N1}s" -f $timer.Elapsed.TotalSeconds) -ForegroundColor Green
+    $idsA = @()
+    $idsB = @()
+    if ($a.Json -ne $null -and $a.Json.items -ne $null) {
+        $idsA = $a.Json.items | Select-Object -First $N | ForEach-Object { $_.id }
+    }
+    if ($b.Json -ne $null -and $b.Json.items -ne $null) {
+        $idsB = $b.Json.items | Select-Object -First $N | ForEach-Object { $_.id }
+    }
+
+    $same = ($idsA.Count -eq $N -and $idsB.Count -eq $N -and ($idsA -join ',') -eq ($idsB -join ','))
+
+    $cmpLines = @()
+    $cmpLines += "A first $N: " + ($idsA -join ',')
+    $cmpLines += "B first $N: " + ($idsB -join ',')
+    $cmpLines += "MATCH: " + $same
+    Write-LogBlock -Path $LogPath -Header "Comparison result" -BodyLines $cmpLines
+
+    if ($same) {
+    Write-Host "COMPARE: PASS – first $N IDs match." -ForegroundColor Green
     } else {
-        $script:FailCount++
-        Write-Host ("FAIL  Duration: {0:N1}s" -f $timer.Elapsed.TotalSeconds) -ForegroundColor Red
+    Write-Host "COMPARE: FAIL – first $N IDs differ." -ForegroundColor Red
+    }
+    Write-Host ("Log: {0}" -f $LogPath)
+    Write-Host ""
+    return [pscustomobject]@{ Name=$name; Passed=$same; DurationS=($a.DurationS + $b.DurationS); Log=$LogPath }
+}
+
+# ---------- Suite ----------
+function Invoke-TestSuite {
+    param([string]$RunDir)
+
+    # Define tests (no pacing; default max-pages=15 in index.js per your spec)
+    $tests = @(
+        @{ Name="count 50";   Desc="Basic run with 50 posts";     Args=@("--count=50");                 Retries=2 },
+        @{ Name="count 100";  Desc="Basic run with 100 posts";    Args=@("--count=100");                Retries=2 },
+        @{ Name="count 150";  Desc="Basic run with 150 posts";    Args=@("--count=150");                Retries=2 },
+        @{ Name="count 200";  Desc="Basic run with 200 posts";    Args=@("--count=200");                Retries=2 },
+        @{ Name="json 10";    Desc="JSON mode 10 posts";          Args=@("--count=10","--json");        Retries=2 },
+        @{ Name="json 50";    Desc="JSON mode 50 posts";          Args=@("--count=50","--json");        Retries=2 },
+        @{ Name="headed 100"; Desc="Visible browser (headed)";    Args=@("--count=100","--headed");     Retries=1 }
+    )
+
+    $suiteSW = [System.Diagnostics.Stopwatch]::StartNew()
+    $pass = 0; $fail = 0
+    $results = @()
+
+    # Create log files per test (nn_name.log)
+    for ($i=0; $i -lt $tests.Count; $i++) {
+        $t = $tests[$i]
+        $nn = "{0:D2}" -f ($i + 1)
+        $file = "{0}_{1}.log" -f $nn, (Sanitize-FileName $t.Name)
+        $t.Log = Join-Path $RunDir $file
+        # Prepend header
+        $hdr = "Test: {0} | Desc: {1} | Args: {2}" -f $t.Name, $t.Desc, ($t.Args -join ' ')
+        Write-LogBlock -Path $t.Log -Header $hdr -BodyLines @()
+    }
+
+    # Run tests
+    foreach ($t in $tests) {
+        $r = Invoke-TestCase -Name $t.Name -Description $t.Desc -CaseArgs $t.Args -LogPath $t.Log -MaxRetries $t.Retries
+        $results += $r
+        if ($r.Passed) { $pass++ } else { $fail++ }
+    }
+
+    # Compare first 100 between 100 vs 150
+    $cmpIdx = $tests.Count + 1
+    $cmpFile = "{0:D2}_{1}.log" -f $cmpIdx, (Sanitize-FileName "compare first 100")
+    $cmpLog  = Join-Path $RunDir $cmpFile
+    $cmp = Compare-FirstN -N 100 -ArgsA @("--count=100","--json") -ArgsB @("--count=150","--json") -LogPath $cmpLog
+    if ($cmp.Passed) { $pass++ } else { $fail++ }
+    $results += $cmp
+
+    $suiteSW.Stop()
+    $dur = [math]::Round($suiteSW.Elapsed.TotalSeconds,1)
+    $total = $pass + $fail
+
+    # Summary to console
+    Write-Host ("=== SUMMARY: {0}/{1} passed, {2} failed. Total time: {3}s ===" -f $pass,$total,$fail,$dur) -ForegroundColor Magenta
+
+    # Summary file
+    $summaryPath = Join-Path $RunDir "SUMMARY.txt"
+    $summaryLines = @()
+    $summaryLines += "Summary"
+    $summaryLines += "======="
+    $summaryLines += ("Passed: {0} / {1}, Failed: {2}, Total Seconds: {3}" -f $pass, $total, $fail, $dur)
+    $summaryLines += ""
+    $summaryLines += "Per-test:"
+    foreach ($r in $results) {
+        $summaryLines += ("- {0}: {1}, Collected={2}, Pages={3}, Dups={4}, Duration={5}s, Log={6}" -f `
+            $r.Name, ($(if($r.Passed){"PASS"}else{"FAIL"})), $r.Collected, $r.Pages, $r.Dups, $r.DurationS, $r.Log)
+    }
+    $summaryLines | Out-File -FilePath $summaryPath -Encoding UTF8
+
+    return [pscustomobject]@{
+        Total   = $total
+        Passed  = $pass
+        Failed  = $fail
+        Seconds = $dur
+        Results = $results
+        RunDir  = $RunDir
+        Summary = $summaryPath
+    }
+}
+
+# ---------- Main: loop until Ctrl+X ----------
+while ($true) {
+    $runDir = New-RunLogDir
+    Write-Host ""
+    Write-Host ("===== Test Run @ {0}  (logs: {1}) =====" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"), $runDir) -ForegroundColor White
+
+    $suite = Invoke-TestSuite -RunDir $runDir
+
+    Write-Host ""
+    Write-Host "Press Ctrl+X to stop, or any key to run the suite again..." -NoNewline
+    $k = [Console]::ReadKey($true)
+    if ((($k.Modifiers -band [ConsoleModifiers]::Control) -ne 0) -and ($k.Key -eq [ConsoleKey]::X)) {
+        Write-Host ""
+        Write-Host "Stopping on Ctrl+X." -ForegroundColor Yellow
+        break
     }
     Write-Host ""
-    Start-Sleep -Milliseconds $PauseBetweenMs
 }
-
-# -------- Test Matrix --------
-
-Invoke-TestCase -Name "count 50"  -Description "Collects 50 posts; headless default output." `
-    -ArgumentList @("--count=50")
-
-Invoke-TestCase -Name "count 100" -Description "Collects 100 posts; headless default output." `
-    -ArgumentList @("--count=100")
-
-Invoke-TestCase -Name "count 150" -Description "Collects 150 posts; checks deeper pagination." `
-    -ArgumentList @("--count=150")
-
-Invoke-TestCase -Name "count 200" -Description "Collects 200 posts; default max-pages=15 may be insufficient (expected to fail sometimes)." `
-    -ArgumentList @("--count=200")
-
-Invoke-TestCase -Name "json 10"   -Description "Returns JSON for 10 posts; quick JSON validation." `
-    -ArgumentList @("--count=10","--json")
-
-Invoke-TestCase -Name "json 50"   -Description "Returns JSON for 50 posts; JSON output size check." `
-    -ArgumentList @("--count=50","--json")
-
-Invoke-CompareFirst100
-
-# Final requested run
-Invoke-TestCase -Name "count 100 verbose" -Description "Runs 100 posts." `
-    -ArgumentList @("--count=100")
-
-# -------- Summary --------
-$elapsed = (Get-Date) - $script:RunStart
-$secs = [math]::Round($elapsed.TotalSeconds,1)
-$total = $script:PassCount + $script:FailCount
-Write-Host ("=== SUMMARY: {0}/{1} passed, {2} failed. Total time: {3}s ===" -f `
-    $script:PassCount, $total, $script:FailCount, $secs)
