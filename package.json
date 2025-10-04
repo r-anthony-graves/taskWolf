@@ -1,0 +1,11 @@
+{
+  "name": "taskWolf",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0"
+  }
+}
