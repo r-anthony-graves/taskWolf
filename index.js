@@ -28,7 +28,7 @@ function parseArgs(argv) {
 }
 
 function fmtItem(i, it) {
-    return `${String(i).padStart(3, ' ')}. ${it.iso || '(no-iso)'}  ${it.id || '(no-id)'}  —  ${it.title || ''}`;
+    return `${String(i).padStart(3, ' ')}. ${it.iso || '(no-iso)'}  ${it.id || '(no-id)'}  -  ${it.title || ''}`;
 }
 
 async function scrapePage(page) {
@@ -129,4 +129,7 @@ async function scrapePage(page) {
     } finally {
         await browser.close();
     }
-})();
+})().catch(err => {
+    console.error('Unhandled error:', err);
+    process.exit(1);
+});
